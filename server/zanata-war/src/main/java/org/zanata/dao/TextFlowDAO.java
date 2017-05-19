@@ -310,6 +310,81 @@ public class TextFlowDAO extends AbstractDAOImpl<HTextFlow, Long> {
         return count == null ? 0 : count.intValue();
     }
 
+    @NativeQuery(value = "need to use MySql order by field function", specificTo = "MySql")
+    public long getUntranslatedTextFlowCountInVersion(Long targetVersionId, HLocale targetLocale) {
+        StringBuilder queryBuilder = new StringBuilder();
+        queryBuilder.append("select count(*) from HTextFlow toTF ")
+                .append(" join HDocument doc on toTF.document_id = doc.id ")
+                .append(" join HProjectIteration ver on ver.id = doc.project_iteration_id ")
+                .append(" left join toTF.targets tft with tft.locale.id =:localeId ")
+                .append(" where toTF.obsolete = false and doc.obsolete = false and and ver.id = :targetVersionId")
+                .append(" and (tft is null or tft.state in (:contentStateList)) ");
+
+        String queryString = queryBuilder.toString();
+        Query query = getSession().createSQLQuery(queryString)
+                .setParameter("localeId", targetLocale.getId())
+                .setParameter("targetVersionId", targetVersionId)
+                .setParameterList("contentStateList", Lists.newArrayList(ContentState.New, ContentState.NeedReview))
+                .setCacheable(true)
+                .setComment("TextFlowDAO.getSourceByMatchedContextCount");
+        Long count = (Long) query.uniqueResult();
+        return count == null ? 0 : count;
+    }
+
+    @NativeQuery(value = "need to use MySql oder by field function", specificTo = "MySql")
+    public List<HTextFlow[]> getSourceByMatchedContext(List<Long> sourceVersionIds,
+            Long targetVersionId, int offset, int maxResults) {
+
+        StringBuilder queryBuilder = new StringBuilder();
+        queryBuilder.append("select * from HTextFlow toTF ")
+                .append(" join HDocument doc on toTF.document_id = doc.id ")
+                .append(" join HProjectIteration ver on ver.id = doc.project_iteration_id ")
+                .append(" where toTF.obsolete = false and doc.obsolete = false and and ver.id = :targetVersionId")
+                .append(" exists (select * from HTextFlow fromTF ")
+                .append("   join HDocument fromDoc on toTF.document_id = fromDoc.id ")
+                .append("   join HProjectIteration fromVer on fromVer.id = fromDoc.project_iteration_id ")
+                .append("   where fromTF.obsolete = false and fromDoc.obsolete = false ")
+                .append("   and fromTF.id <> toTF.id ")
+                .append("   and fromTF.resId = toTF.resId ")
+                .append("   and doc.docId = fromDoc.docId ")
+                .append("   and fromVer.id in (:fromVersionIds) ")
+                .append("   order by field(id, :fromVersionIds)")
+                .append(" ) as fromTF limit 1");
+        Query query = getSession().createQuery(queryBuilder.toString())
+                .setParameter("fromVersionIds", sourceVersionIds)
+                .setParameter("targetVersionId", targetVersionId)
+                .setMaxResults(maxResults).setFirstResult(offset)
+                .setCacheable(true)
+                .setComment("TextFlowDAO.getTranslationsByMatchedContext");
+        List<HTextFlow[]> results = Lists.newArrayList();
+        for (Object result : query.list()) {
+            Object[] castResults = (Object[]) result;
+            results.add(new HTextFlow[] { (HTextFlow) castResults[0],
+                    (HTextFlow) castResults[1] });
+        }
+        return results;
+    }
+
+    // https://www.electrictoolbox.com/mysql-order-specific-field-values/
+    private String generateSourceByMatchedContext2(boolean getRecordCount) {
+        StringBuilder queryBuilder = new StringBuilder();
+        queryBuilder.append("select count(*) from HTextFlow toTF ")
+                .append(" join HDocument doc on toTF.document_id = doc.id ")
+                .append(" join HProjectIteration ver on ver.id = doc.project_iteration_id ")
+                .append(" where toTF.obsolete = false and doc.obsolete = false and and ver.id = :targetVersionId")
+                .append(" exists (select fromTF.id from HTextFlow fromTF ")
+                .append("   join HDocument fromDoc on toTF.document_id = fromDoc.id ")
+                .append("   join HProjectIteration fromVer on fromVer.id = fromDoc.project_iteration_id ")
+                .append("   where fromTF.obsolete = false and fromDoc.obsolete = false ")
+                .append("   and fromTF.id <> toTF.id ")
+                .append("   and fromTF.resId = toTF.resId ")
+                .append("   and doc.docId = fromDoc.docId ")
+                .append("   and fromVer.id in (:fromVersionIds) ")
+                .append("   order by field(id, :fromVersionIds)")
+                .append(" ) limit 1");
+        return queryBuilder.toString();
+    }
+
     /**
      * Generate query string for text flows that have matching document id and
      * content between the given source and target version

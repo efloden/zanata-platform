@@ -7,12 +7,15 @@ import static org.zanata.webtrans.server.rpc.GetTransUnitsNavigationService.Text
 import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.ws.rs.DefaultValue;
+import javax.ws.rs.POST;
 import javax.ws.rs.Path;
 import javax.ws.rs.PathParam;
+import javax.ws.rs.QueryParam;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.EntityTag;
 import javax.ws.rs.core.GenericEntity;
@@ -24,6 +27,7 @@ import org.apache.commons.lang.StringUtils;
 import org.apache.deltaspike.jpa.api.transaction.Transactional;
 import org.jboss.resteasy.util.GenericType;
 import org.zanata.ApplicationConfiguration;
+import org.zanata.action.MergeTranslationsManager;
 import org.zanata.common.ContentState;
 import org.zanata.common.EntityStatus;
 import org.zanata.common.ProjectType;
@@ -44,7 +48,10 @@ import org.zanata.rest.dto.ProjectIteration;
 import org.zanata.rest.dto.TransUnitStatus;
 import org.zanata.rest.dto.User;
 import org.zanata.rest.dto.resource.ResourceMeta;
+import org.zanata.rest.editor.service.TransMemoryMergeManager;
 import org.zanata.rest.editor.service.UserService;
+import org.zanata.webtrans.shared.model.ProjectIterationId;
+import org.zanata.webtrans.shared.rest.dto.TransMemoryMergeRequest;
 import org.zanata.webtrans.shared.search.FilterConstraints;
 import org.zanata.security.ZanataIdentity;
 import org.zanata.service.ConfigurationService;
@@ -88,6 +95,8 @@ public class ProjectVersionService implements ProjectVersionResource {
     private ApplicationConfiguration applicationConfiguration;
     @Context
     private UriInfo uri;
+    @Inject
+    private MergeTranslationsManager mergeTranslationsManager;
 
     @Override
     public Response head(@PathParam("projectSlug") String projectSlug,
@@ -114,21 +123,13 @@ public class ProjectVersionService implements ProjectVersionResource {
             return projTypeError;
         }
         HProject hProject = projectDAO.getBySlug(projectSlug);
-        if (hProject == null) {
-            return Response.status(Response.Status.NOT_FOUND)
-                    .entity("Project \'" + projectSlug + "\' not found.")
-                    .build();
-        } else if (Objects.equal(hProject.getStatus(), OBSOLETE)) {
-            // Project is Obsolete
-            return Response.status(Response.Status.NOT_FOUND)
-                    .entity("Project \'" + projectSlug + "\' not found.")
-                    .build();
-        } else if (Objects.equal(hProject.getStatus(), READONLY)) {
-            // Project is ReadOnly
-            return Response.status(Response.Status.FORBIDDEN)
-                    .entity("Project \'" + projectSlug + "\' is read-only.")
-                    .build();
+
+        Optional<Response> projectResponse =
+                getResponseIfProjectIsNotActive(hProject, projectSlug);
+        if (projectResponse.isPresent()) {
+            return projectResponse.get();
         }
+
         HProjectIteration hProjectVersion =
                 projectIterationDAO.getBySlug(projectSlug, versionSlug);
         if (hProjectVersion == null) {
@@ -179,6 +180,26 @@ public class ProjectVersionService implements ProjectVersionResource {
             etag = eTagUtils.generateETagForIteration(projectSlug, versionSlug);
         }
         return response.tag(etag).build();
+    }
+
+    private Optional<Response> getResponseIfProjectIsNotActive(
+            HProject hProject, String projectSlug) {
+        if (hProject == null) {
+            return Optional.of(Response.status(Response.Status.NOT_FOUND)
+                    .entity("Project \'" + projectSlug + "\' not found.")
+                    .build());
+        } else if (Objects.equal(hProject.getStatus(), OBSOLETE)) {
+            // Project is Obsolete
+            return Optional.of(Response.status(Response.Status.NOT_FOUND)
+                    .entity("Project \'" + projectSlug + "\' not found.")
+                    .build());
+        } else if (Objects.equal(hProject.getStatus(), READONLY)) {
+            // Project is ReadOnly
+            return Optional.of(Response.status(Response.Status.FORBIDDEN)
+                    .entity("Project \'" + projectSlug + "\' is read-only.")
+                    .build());
+        }
+        return Optional.empty();
     }
 
     @Override
@@ -320,6 +341,48 @@ public class ProjectVersionService implements ProjectVersionResource {
         }.getGenericType();
         Object entity = new GenericEntity<>(statusList, genericType);
         return Response.ok(entity).build();
+    }
+
+    @POST
+    @Path(VERSION_SLUG_TEMPLATE + "/tm-merge")
+    public Response prefillWithTM(@PathParam("projectSlug") String projectSlug,
+            @PathParam("versionSlug") String versionSlug,
+            @QueryParam("fromProjectVersions") List<ProjectIterationId> fromVersions,
+            @QueryParam("localeId") String localeId,
+            @QueryParam("acceptDifferentContent") boolean acceptDifferentContent) {
+        HProject hProject = projectDAO.getBySlug(projectSlug);
+
+        Optional<Response> projectResponse =
+                getResponseIfProjectIsNotActive(hProject, projectSlug);
+        if (projectResponse.isPresent()) {
+            return projectResponse.get();
+        }
+        HProjectIteration version =
+                projectIterationDAO.getBySlug(hProject, versionSlug);
+        if (version == null || version.getStatus() == OBSOLETE) {
+            return Response.status(Response.Status.NOT_FOUND)
+                    .entity("Project version \'" + projectSlug + ":"
+                            + versionSlug + "\' not found.")
+                    .build();
+        } else if (version.getStatus() == READONLY) {
+            return Response.status(Response.Status.FORBIDDEN)
+                    .entity("Project version \'" + projectSlug + ":"
+                            + versionSlug + "\' is readonly.")
+                    .build();
+        }
+        HLocale hLocale = localeServiceImpl.getByLocaleId(localeId);
+        if (hLocale == null) {
+            return Response.status(Response.Status.NOT_FOUND).build();
+        }
+
+        // TODO pahuang check security
+        boolean started = mergeTranslationsManager
+                .start(version, hLocale, fromVersions,
+                        acceptDifferentContent);
+        if (!started) {
+            throw new UnsupportedOperationException("There is already version merge operation in progress");
+        }
+        return Response.accepted().build();
     }
 
     @VisibleForTesting

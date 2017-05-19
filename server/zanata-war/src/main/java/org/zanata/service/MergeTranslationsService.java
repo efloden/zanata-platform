@@ -20,10 +20,13 @@
  */
 package org.zanata.service;
 
+import java.util.List;
 import java.util.concurrent.Future;
 
 import org.zanata.async.handle.MergeTranslationsTaskHandle;
+import org.zanata.model.HLocale;
 import org.zanata.model.HProjectIteration;
+import org.zanata.webtrans.shared.model.ProjectIterationId;
 
 public interface MergeTranslationsService {
     //@formatter:off
@@ -51,4 +54,8 @@ public interface MergeTranslationsService {
      */
     int getTotalProgressCount(HProjectIteration sourceVersion,
         HProjectIteration targetVersion);
+
+    Future<Void> startMergeTranslations(HProjectIteration version, HLocale hLocale,
+            List<ProjectIterationId> fromVersions,
+            boolean acceptDifferentContent, MergeTranslationsTaskHandle handle);
 }

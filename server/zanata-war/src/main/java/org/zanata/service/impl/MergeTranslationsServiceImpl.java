@@ -20,22 +20,26 @@
  */
 package org.zanata.service.impl;
 
+import static org.zanata.events.TextFlowTargetStateEvent.TextFlowTargetStateChange;
+import static org.zanata.transaction.TransactionUtilImpl.runInTransaction;
+
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Future;
+import java.util.stream.Collectors;
+
 import javax.annotation.Nonnull;
-import com.google.common.collect.HashMultimap;
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Multimap;
 import javax.enterprise.context.RequestScoped;
 import javax.enterprise.event.Event;
 import javax.inject.Inject;
 import javax.inject.Named;
+
 import org.zanata.async.Async;
 import org.zanata.async.AsyncTaskResult;
 import org.zanata.async.handle.MergeTranslationsTaskHandle;
 import org.zanata.common.ContentState;
+import org.zanata.common.EntityStatus;
 import org.zanata.dao.ProjectIterationDAO;
 import org.zanata.dao.TextFlowDAO;
 import org.zanata.events.DocStatsEvent;
@@ -47,6 +51,7 @@ import org.zanata.model.HProjectIteration;
 import org.zanata.model.HSimpleComment;
 import org.zanata.model.HTextFlow;
 import org.zanata.model.HTextFlowTarget;
+import org.zanata.model.ModelEntityBase;
 import org.zanata.model.type.TranslationSourceType;
 import org.zanata.security.ZanataIdentity;
 import org.zanata.security.annotations.Authenticated;
@@ -55,11 +60,14 @@ import org.zanata.service.MergeTranslationsService;
 import org.zanata.service.TranslationStateCache;
 import org.zanata.service.VersionStateCache;
 import org.zanata.util.TranslationUtil;
+import org.zanata.webtrans.shared.model.ProjectIterationId;
+
 import com.google.common.base.Optional;
 import com.google.common.base.Stopwatch;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Maps;
-import static org.zanata.events.TextFlowTargetStateEvent.TextFlowTargetStateChange;
-import static org.zanata.transaction.TransactionUtilImpl.runInTransaction;
+import com.google.common.collect.Multimap;
 // Not @Transactional, because we use runInTransaction
 
 /**
@@ -178,6 +186,108 @@ public class MergeTranslationsServiceImpl implements MergeTranslationsService {
             log.warn("exception during copy text flow target", e);
             return 0;
         }
+    }
+
+    protected int mergeTranslationBatch2(List<Long> fromVersionIds,
+            HProjectIteration targetVersion, long offset, int batchSize) {
+        try {
+            return runInTransaction(() -> this.mergeTranslations2(
+                    fromVersionIds, targetVersion.getId(), offset,
+                    batchSize));
+        } catch (Exception e) {
+            log.warn("exception during copy text flow target", e);
+            return 0;
+        }
+    }
+
+    private Integer mergeTranslations2(final List<Long> sourceVersionId,
+            final Long targetVersionId, final long batchStart,
+            final int batchLength) throws Exception {
+        final Stopwatch stopwatch = Stopwatch.createUnstarted();
+        stopwatch.start();
+        List<HTextFlow[]> matches = textFlowDAO.getSourceByMatchedContext(
+                sourceVersionId, targetVersionId, batchStart, batchLength);
+        Multimap<DocumentLocaleKey, TextFlowTargetStateChange> eventMap =
+                HashMultimap.create();
+        Map<DocumentLocaleKey, Map<ContentState, Long>> docStatsMap =
+                Maps.newHashMap();
+        Map<DocumentLocaleKey, Long> lastUpdatedTargetId = Maps.newHashMap();
+        ;
+        for (HTextFlow[] results : matches) {
+            HTextFlow sourceTf = results[0];
+            HTextFlow targetTf = results[1];
+            boolean foundChange = false;
+            Map<Long, ContentState> localeContentStateMap = Maps.newHashMap();
+            for (HLocale hLocale : supportedLocales) {
+                HTextFlowTarget sourceTft =
+                        sourceTf.getTargets().get(hLocale.getId());
+                // only process translated state
+                if (sourceTft == null || !sourceTft.getState().isTranslated()) {
+                    continue;
+                }
+                HTextFlowTarget targetTft =
+                        targetTf.getTargets().get(hLocale.getId());
+                if (targetTft == null) {
+                    targetTft = new HTextFlowTarget(targetTf, hLocale);
+                    targetTft.setVersionNum(0);
+                    targetTf.getTargets().put(hLocale.getId(), targetTft);
+                }
+                if (MergeTranslationsServiceImpl.shouldMerge(sourceTft,
+                        targetTft, useNewerTranslation)) {
+                    foundChange = true;
+                    ContentState oldState = targetTft.getState();
+                    localeContentStateMap.put(hLocale.getId(), oldState);
+                    mergeTextFlowTarget(sourceTft, targetTft);
+                }
+            }
+            if (foundChange) {
+                translationStateCacheImpl.clearDocumentStatistics(
+                        targetTf.getDocument().getId());
+                textFlowDAO.makePersistent(targetTf);
+                textFlowDAO.flush();
+                for (Map.Entry<Long, ContentState> entry : localeContentStateMap
+                        .entrySet()) {
+                    HTextFlowTarget updatedTarget =
+                            targetTf.getTargets().get(entry.getKey());
+                    DocumentLocaleKey key = new DocumentLocaleKey(
+                            targetTf.getDocument().getId(),
+                            updatedTarget.getLocale().getLocaleId());
+                    eventMap.put(key,
+                            new TextFlowTargetStateEvent.TextFlowTargetStateChange(
+                                    targetTf.getId(), updatedTarget.getId(),
+                                    updatedTarget.getState(),
+                                    entry.getValue()));
+                    lastUpdatedTargetId.put(key, updatedTarget.getId());
+                    Map<ContentState, Long> contentStateDeltas =
+                            docStatsMap.get(key) == null ? Maps.newHashMap()
+                                    : docStatsMap.get(key);
+                    DocStatsEvent.updateContentStateDeltas(contentStateDeltas,
+                            updatedTarget.getState(), entry.getValue(),
+                            targetTf.getWordCount());
+                    docStatsMap.put(key, contentStateDeltas);
+                }
+            }
+        }
+        Long actorId = authenticatedAccount.getPerson().getId();
+        for (Map.Entry<DocumentLocaleKey, Collection<TextFlowTargetStateChange>> entry : eventMap
+                .asMap().entrySet()) {
+            TextFlowTargetStateEvent tftUpdatedEvent =
+                    new TextFlowTargetStateEvent(entry.getKey(),
+                            targetVersionId, actorId,
+                            ImmutableList.copyOf(entry.getValue()));
+            textFlowTargetStateEvent.fire(tftUpdatedEvent);
+        }
+        for (Map.Entry<DocumentLocaleKey, Map<ContentState, Long>> entry : docStatsMap
+                .entrySet()) {
+            DocStatsEvent docEvent = new DocStatsEvent(entry.getKey(),
+                    targetVersionId, entry.getValue(),
+                    lastUpdatedTargetId.get(entry.getKey()));
+            docStatsEvent.fire(docEvent);
+        }
+        stopwatch.stop();
+        log.info("Complete merge translations of {} in {}",
+                matches.size() * supportedLocales.size(), stopwatch);
+        return matches.size() * supportedLocales.size();
     }
 
     private Integer mergeTranslations(final Long sourceVersionId,
@@ -302,16 +412,21 @@ public class MergeTranslationsServiceImpl implements MergeTranslationsService {
      */
     private boolean isVersionsEmpty(HProjectIteration sourceVersion,
             HProjectIteration targetVersion) {
-        if (sourceVersion.getDocuments().isEmpty()) {
-            log.error("No documents in source version {}:{}",
-                    sourceVersion.getProject().getSlug(),
-                    sourceVersion.getSlug());
-            return true;
-        }
+        if (isVersionEmpty(sourceVersion)) return true;
         if (targetVersion.getDocuments().isEmpty()) {
             log.error("No documents in target version {}:{}",
                     targetVersion.getProject().getSlug(),
                     targetVersion.getSlug());
+            return true;
+        }
+        return false;
+    }
+
+    private boolean isVersionEmpty(HProjectIteration version) {
+        if (version.getDocuments().isEmpty()) {
+            log.error("No documents in source version {}:{}",
+                    version.getProject().getSlug(),
+                    version.getSlug());
             return true;
         }
         return false;
@@ -327,6 +442,15 @@ public class MergeTranslationsServiceImpl implements MergeTranslationsService {
         handle.setTotalTranslations(total);
     }
 
+    private void prepareMergeTranslationsHandle2(
+            long total,
+            @Nonnull MergeTranslationsTaskHandle handle) {
+        handle.setTriggeredBy(identity.getAccountUsername());
+        // TODO pahuang what is this maxProgress?
+        handle.setMaxProgress((int) total);
+        handle.setTotalTranslations(total);
+    }
+
     @Override
     public int getTotalProgressCount(HProjectIteration sourceVersion,
             HProjectIteration targetVersion) {
@@ -335,6 +459,72 @@ public class MergeTranslationsServiceImpl implements MergeTranslationsService {
         List<HLocale> locales = getSupportedLocales(
                 targetVersion.getProject().getSlug(), targetVersion.getSlug());
         return matchCount * locales.size();
+    }
+
+    @Async
+    @Override
+    public Future<Void> startMergeTranslations(HProjectIteration targetVersion,
+            HLocale hLocale, List<ProjectIterationId> fromVersions,
+            boolean acceptDifferentContent,
+            MergeTranslationsTaskHandle handle) {
+        List<Long> fromVersionIds = fromVersions.stream()
+                .map(projectIterationId -> projectIterationDAO.getBySlug(
+                        projectIterationId.getProjectSlug(),
+                        projectIterationId.getIterationSlug()))
+                .filter(ver -> ver != null
+                        && ver.getStatus() != EntityStatus.OBSOLETE
+                        && localeServiceImpl
+                                .getSupportedLanguageByProjectIteration(ver)
+                                .contains(hLocale))
+                .map(ModelEntityBase::getId).collect(Collectors.toList());
+
+        if (fromVersionIds.isEmpty()) {
+            log.error("Cannot find source versions of {}", fromVersions);
+            return AsyncTaskResult.completed();
+        }
+
+        if (isVersionEmpty(targetVersion)) {
+            return AsyncTaskResult.completed();
+        }
+        List<HLocale> localesInTargetVersion = localeServiceImpl
+                .getSupportedLanguageByProjectIteration(targetVersion);
+        if (!localesInTargetVersion.contains(hLocale)) {
+            log.error("No locales enabled in target version of [{}]",
+                    targetVersion.userFriendlyToString());
+            return AsyncTaskResult.completed();
+        }
+
+        long matchCount = textFlowDAO.getUntranslatedTextFlowCountInVersion(
+                targetVersion.getId(), hLocale);
+
+        long total = matchCount;
+        Optional<MergeTranslationsTaskHandle> taskHandleOpt =
+                Optional.fromNullable(handle);
+        if (taskHandleOpt.isPresent()) {
+            prepareMergeTranslationsHandle2(total, taskHandleOpt.get());
+        }
+        Stopwatch overallStopwatch = Stopwatch.createStarted();
+        log.info("merge translations start: from {} to {}",
+                fromVersionIds,
+                targetVersion.userFriendlyToString());
+        long startCount = 0;
+
+
+        while (startCount < total) {
+            int processedCount = mergeTranslationBatch2(fromVersionIds,
+                    targetVersion,
+                    startCount, TEXTFLOWS_PER_BATCH);
+            if (taskHandleOpt.isPresent()) {
+                taskHandleOpt.get().increaseProgress(processedCount);
+            }
+            startCount += TEXTFLOWS_PER_BATCH;
+            textFlowDAO.clear();
+        }
+        versionStateCacheImpl.clearVersionStatsCache(targetVersion.getId());
+        log.info("merge translation end: from {} to {}, {}",
+                fromVersionIds,
+                targetVersion.userFriendlyToString(), overallStopwatch);
+        return AsyncTaskResult.completed();
     }
 
     private int getTotalMatchCount(Long sourceVersionId, Long targetVersionId) {
